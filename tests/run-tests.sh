@@ -34,13 +34,28 @@ assert_contains "$parser_output" "cues="
 
 bili_output="$($executable --integration-test "$script_dir/fake-yt-dlp.sh" "$test_dir" 'https://www.bilibili.com/video/BVTEST' 0)"
 assert_contains "$bili_output" "完整逐字稿"
+assert_contains "$bili_output" "traffic-bytes="
 
 douyin_output="$($executable --integration-test "$script_dir/fake-yt-dlp.sh" "$test_dir" 'https://www.douyin.com/video/1234567890?nosub=1' 2)"
 assert_contains "$douyin_output" "已保存最低码率纯音频"
+assert_contains "$douyin_output" "traffic-bytes=4096"
 
 audio_count="$(find "$test_dir" -name '*.m4a' -type f | wc -l | tr -d ' ')"
 if [[ "$audio_count" -lt 1 ]]; then
   echo "断言失败：抖音音频输出不存在"
+  exit 1
+fi
+
+info_file="$(find "$test_dir" -name '视频信息.txt' -type f | tail -1)"
+assert_contains "$(<"$info_file")" "估算下行流量："
+
+"$executable" --traffic-history-test "$test_dir" >/dev/null
+history_file="$test_dir/流量记录.csv"
+assert_contains "$(<"$history_file")" '"成功","抖音","仅音频","4096"'
+assert_contains "$(<"$history_file")" '"失败","Bilibili","自动","1024"'
+history_lines="$(wc -l < "$history_file" | tr -d ' ')"
+if [[ "$history_lines" != "3" ]]; then
+  echo "断言失败：流量记录应包含表头和两条任务记录"
   exit 1
 fi
 

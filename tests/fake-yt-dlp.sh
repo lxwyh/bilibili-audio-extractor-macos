@@ -31,9 +31,11 @@ fi
 
 if [[ "$args" == *"-f wa"* ]]; then
   if [[ "$args" == *"douyin.com"* ]]; then
-    touch "$destination/抖音测试视频 [1234567890].m4a"
+    truncate -s 4096 "$destination/抖音测试视频 [1234567890].m4a"
+    echo "__TRAFFIC__1234567890|4096"
   else
-    touch "$destination/B站测试视频 [BVTEST].m4a"
+    truncate -s 4096 "$destination/B站测试视频 [BVTEST].m4a"
+    echo "__TRAFFIC__BVTEST|4096"
   fi
   exit 0
 fi

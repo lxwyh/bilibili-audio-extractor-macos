@@ -7,6 +7,14 @@ enum ExtractMode: Int {
     case automatic = 0
     case subtitlesOnly = 1
     case audioOnly = 2
+
+    var displayName: String {
+        switch self {
+        case .automatic: return "自动"
+        case .subtitlesOnly: return "仅字幕"
+        case .audioOnly: return "仅音频"
+        }
+    }
 }
 
 enum VideoPlatform: String {
@@ -38,6 +46,76 @@ struct VideoInput {
             return VideoInput(url: candidate, platform: .douyin)
         }
         return nil
+    }
+}
+
+struct ExtractionResult {
+    let folder: URL
+    let downloadedBytes: Int64
+}
+
+final class TrafficMeter {
+    private let marker = "__TRAFFIC__"
+    private let lock = NSLock()
+    private var bytesByItem: [String: Int64] = [:]
+
+    func consume(_ line: String) -> Int64? {
+        guard let markerRange = line.range(of: marker) else { return nil }
+        let payload = line[markerRange.upperBound...]
+        let parts = payload.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let bytes = Int64(parts[1]), bytes >= 0 else { return totalBytes }
+        let key = String(parts[0])
+        lock.lock()
+        bytesByItem[key] = max(bytesByItem[key] ?? 0, bytes)
+        let total = bytesByItem.values.reduce(0, +)
+        lock.unlock()
+        return total
+    }
+
+    var totalBytes: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return bytesByItem.values.reduce(0, +)
+    }
+}
+
+enum ByteDisplay {
+    static func string(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
+    }
+}
+
+enum TrafficHistory {
+    static func append(destination: URL, platform: VideoPlatform, mode: ExtractMode, sourceURL: String,
+                       bytes: Int64, status: String, detail: String) throws {
+        let target = destination.appendingPathComponent("流量记录.csv")
+        if !FileManager.default.fileExists(atPath: target.path) {
+            let header = "时间,状态,平台,模式,估算字节数,易读流量,来源链接,结果或错误\n"
+            try header.write(to: target, atomically: true, encoding: .utf8)
+        }
+        let fields = [
+            ISO8601DateFormatter().string(from: Date()), status, platform.rawValue, mode.displayName,
+            String(bytes), ByteDisplay.string(bytes), sourceURL, detail
+        ].map(csvEscape)
+        guard let data = (fields.joined(separator: ",") + "\n").data(using: .utf8),
+              let handle = try? FileHandle(forWritingTo: target) else {
+            throw NSError(domain: "TrafficHistory", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "无法写入流量记录.csv"])
+        }
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+    }
+
+    private static func csvEscape(_ value: String) -> String {
+        let normalized = value.replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return "\"\(normalized.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 }
 
@@ -206,14 +284,24 @@ final class ExtractorService {
     init(executable: URL) { runner = ProcessRunner(executable: executable) }
 
     func extract(url: String, platform: VideoPlatform, destination: URL, mode: ExtractMode, allParts: Bool,
-                 browser: String?, log: @escaping (String) -> Void) throws -> URL {
+                 browser: String?, log: @escaping (String) -> Void,
+                 onTraffic: @escaping (Int64) -> Void = { _ in }) throws -> ExtractionResult {
         let jobURL = fileManager.temporaryDirectory.appendingPathComponent("MediaExtractor-\(UUID().uuidString)")
         try fileManager.createDirectory(at: jobURL, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: jobURL) }
 
+        let trafficMeter = TrafficMeter()
+        var observedFileBytes: Int64 = 0
+        let handleLine: (String) -> Void = { line in
+            if let bytes = trafficMeter.consume(line) {
+                onTraffic(bytes)
+            } else {
+                log(line)
+            }
+        }
         let common = commonArguments(allParts: allParts, browser: browser)
         log("正在读取视频信息…")
-        let metadata = try runner.run(arguments: common + ["--skip-download", "--print", "%(title)s", url], onLine: log)
+        let metadata = try runner.run(arguments: common + ["--skip-download", "--print", "%(title)s", url], onLine: handleLine)
         guard metadata.0 == 0 else {
             throw NSError(domain: "Extractor", code: 2, userInfo: [NSLocalizedDescriptionKey: friendlyError(metadata.1, platform: platform)])
         }
@@ -236,8 +324,10 @@ final class ExtractorService {
                 "--write-info-json", "-P", jobURL.path,
                 "-o", "%(title).120B [%(id)s].%(ext)s", url
             ]
-            _ = try runner.run(arguments: subtitleArgs, onLine: log)
+            _ = try runner.run(arguments: subtitleArgs, onLine: handleLine)
             let candidates = transcriptFiles(in: jobURL)
+            observedFileBytes = max(observedFileBytes, totalFileBytes(in: jobURL))
+            onTraffic(max(trafficMeter.totalBytes, observedFileBytes))
             let parsed = candidates.map { ($0, TranscriptParser.parse(url: $0)) }.filter { !$0.1.isEmpty }
             if !parsed.isEmpty {
                 try fileManager.createDirectory(at: finalFolder, withIntermediateDirectories: true)
@@ -278,10 +368,12 @@ final class ExtractorService {
                 "-f", format, "-P", jobURL.path,
                 "-o", "%(title).120B [%(id)s].%(ext)s", url
             ]
-            let result = try runner.run(arguments: audioArgs, onLine: log)
+            let result = try runner.run(arguments: audioArgs, onLine: handleLine)
             guard result.0 == 0 else { throw NSError(domain: "Extractor", code: 4, userInfo: [NSLocalizedDescriptionKey: friendlyError(result.1, platform: platform)]) }
             let audioFiles = mediaFiles(in: jobURL)
             guard !audioFiles.isEmpty else { throw NSError(domain: "Extractor", code: 5, userInfo: [NSLocalizedDescriptionKey: "音频下载完成，但没有找到输出文件。请更新应用内的 yt-dlp 后重试。"]) }
+            observedFileBytes = max(observedFileBytes, totalFileBytes(in: jobURL))
+            onTraffic(max(trafficMeter.totalBytes, observedFileBytes))
             try fileManager.createDirectory(at: finalFolder, withIntermediateDirectories: true)
             for file in audioFiles {
                 if platform == .douyin && file.pathExtension.lowercased() == "mp4" {
@@ -302,20 +394,27 @@ final class ExtractorService {
         }
 
         try fileManager.createDirectory(at: finalFolder, withIntermediateDirectories: true)
+        let downloadedBytes = max(trafficMeter.totalBytes, observedFileBytes)
         let info = """
         来源：\(url)
         标题：\(title)
         提取时间：\(ISO8601DateFormatter().string(from: Date()))
         结果：\(foundTranscript ? "字幕与逐字稿" : "最低码率纯音频")
+        估算下行流量：\(ByteDisplay.string(downloadedBytes))（\(downloadedBytes) 字节）
 
         本工具只处理用户有权访问和使用的内容。
         """
         try info.write(to: finalFolder.appendingPathComponent("视频信息.txt"), atomically: true, encoding: .utf8)
-        return finalFolder
+        log("本次估算下行流量：\(ByteDisplay.string(downloadedBytes))")
+        onTraffic(downloadedBytes)
+        return ExtractionResult(folder: finalFolder, downloadedBytes: downloadedBytes)
     }
 
     private func commonArguments(allParts: Bool, browser: String?) -> [String] {
-        var args = ["--newline", "--no-warnings"]
+        var args = [
+            "--newline", "--no-warnings", "--progress", "--progress-delta", "0.25",
+            "--progress-template", "download:__TRAFFIC__%(info.id)s|%(progress.downloaded_bytes)s"
+        ]
         args.append(allParts ? "--yes-playlist" : "--no-playlist")
         if let browser, !browser.isEmpty { args += ["--cookies-from-browser", browser] }
         return args
@@ -337,6 +436,12 @@ final class ExtractorService {
         guard let enumerator = fileManager.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
         return enumerator.compactMap { $0 as? URL }.filter {
             (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }
+    }
+
+    private func totalFileBytes(in folder: URL) -> Int64 {
+        files(in: folder).reduce(0) { partial, url in
+            partial + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
     }
 
@@ -430,9 +535,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let startButton = NSButton(title: "开始提取", target: nil, action: nil)
     private let openButton = NSButton(title: "打开结果", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "就绪")
+    private let trafficLabel = NSTextField(labelWithString: "本次流量：0 KB")
     private let progress = NSProgressIndicator()
     private let logView = NSTextView()
     private var lastOutput: URL?
+    private var currentTrafficBytes: Int64 = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
@@ -539,6 +646,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         progress.style = .spinning; progress.controlSize = .small
         actionRow.addArrangedSubview(startButton); actionRow.addArrangedSubview(openButton); actionRow.addArrangedSubview(progress)
         actionRow.addArrangedSubview(statusLabel)
+        trafficLabel.textColor = .secondaryLabelColor
+        trafficLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        actionRow.addArrangedSubview(trafficLabel)
         root.addArrangedSubview(actionRow)
 
         let scroll = NSScrollView()
@@ -597,6 +707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setBusy(true)
         logView.string = ""
+        currentTrafficBytes = 0
+        trafficLabel.stringValue = "本次流量：0 KB"
         appendLog("已识别平台：\(videoInput.platform.rawValue)")
         appendLog("开始处理：\(videoInput.url)")
         let mode = ExtractMode(rawValue: modePopup.indexOfSelectedItem) ?? .automatic
@@ -609,21 +721,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             do {
                 let service = ExtractorService(executable: executable)
-                let folder = try service.extract(url: videoInput.url, platform: videoInput.platform,
+                let result = try service.extract(url: videoInput.url, platform: videoInput.platform,
                                                  destination: destination, mode: mode,
-                                                 allParts: processAll, browser: browser ?? nil) { line in
+                                                 allParts: processAll, browser: browser ?? nil, log: { line in
                     DispatchQueue.main.async { self.appendLog(line) }
-                }
+                }, onTraffic: { bytes in
+                    DispatchQueue.main.async { self.updateTraffic(bytes) }
+                })
+                try TrafficHistory.append(destination: destination, platform: videoInput.platform, mode: mode,
+                                          sourceURL: videoInput.url, bytes: result.downloadedBytes,
+                                          status: "成功", detail: result.folder.path)
                 DispatchQueue.main.async {
-                    self.lastOutput = folder
+                    self.lastOutput = result.folder
                     self.openButton.isEnabled = true
                     self.statusLabel.stringValue = "完成"
-                    self.appendLog("完成：\(folder.path)")
+                    self.updateTraffic(result.downloadedBytes)
+                    self.appendLog("完成：\(result.folder.path)")
+                    self.appendLog("流量记录：\(destination.appendingPathComponent("流量记录.csv").path)")
                     self.setBusy(false)
                     NSSound(named: "Glass")?.play()
                 }
             } catch {
                 DispatchQueue.main.async {
+                    do {
+                        try TrafficHistory.append(destination: destination, platform: videoInput.platform, mode: mode,
+                                                  sourceURL: videoInput.url, bytes: self.currentTrafficBytes,
+                                                  status: "失败", detail: error.localizedDescription)
+                    } catch {
+                        self.appendLog("流量历史写入失败：\(error.localizedDescription)")
+                    }
                     self.setBusy(false)
                     self.statusLabel.stringValue = "失败"
                     self.appendLog("错误：\(error.localizedDescription)")
@@ -647,6 +773,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logView.scrollToEndOfDocument(nil)
     }
 
+    private func updateTraffic(_ bytes: Int64) {
+        currentTrafficBytes = max(currentTrafficBytes, bytes)
+        trafficLabel.stringValue = "本次流量：\(ByteDisplay.string(currentTrafficBytes))"
+    }
+
     private func showError(_ message: String) {
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "无法完成操作"; alert.informativeText = message
         alert.runModal()
@@ -663,15 +794,31 @@ if CommandLine.arguments.count >= 6 && CommandLine.arguments[1] == "--integratio
         exit(2)
     }
     do {
-        let folder = try ExtractorService(executable: executable).extract(
+        let result = try ExtractorService(executable: executable).extract(
             url: input.url, platform: input.platform, destination: destination,
             mode: mode, allParts: false, browser: nil,
             log: { print($0) }
         )
-        print("output=\(folder.path)")
+        print("output=\(result.folder.path)")
+        print("traffic-bytes=\(result.downloadedBytes)")
         exit(0)
     } catch {
         fputs("integration-test error: \(error.localizedDescription)\n", stderr)
+        exit(3)
+    }
+} else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--traffic-history-test" {
+    let destination = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    do {
+        try TrafficHistory.append(destination: destination, platform: .douyin, mode: .audioOnly,
+                                  sourceURL: "https://www.douyin.com/video/123", bytes: 4096,
+                                  status: "成功", detail: "测试结果")
+        try TrafficHistory.append(destination: destination, platform: .bilibili, mode: .automatic,
+                                  sourceURL: "https://www.bilibili.com/video/BVTEST", bytes: 1024,
+                                  status: "失败", detail: "测试错误")
+        print(destination.appendingPathComponent("流量记录.csv").path)
+        exit(0)
+    } catch {
+        fputs("traffic-history-test error: \(error.localizedDescription)\n", stderr)
         exit(3)
     }
 } else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--parse-input" {
