@@ -7,14 +7,6 @@ enum ExtractMode: Int {
     case automatic = 0
     case subtitlesOnly = 1
     case audioOnly = 2
-
-    var displayName: String {
-        switch self {
-        case .automatic: return "自动"
-        case .subtitlesOnly: return "仅字幕"
-        case .audioOnly: return "仅音频"
-        }
-    }
 }
 
 enum VideoPlatform: String {
@@ -86,36 +78,6 @@ enum ByteDisplay {
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: max(0, bytes))
-    }
-}
-
-enum TrafficHistory {
-    static func append(destination: URL, platform: VideoPlatform, mode: ExtractMode, sourceURL: String,
-                       bytes: Int64, status: String, detail: String) throws {
-        let target = destination.appendingPathComponent("流量记录.csv")
-        if !FileManager.default.fileExists(atPath: target.path) {
-            let header = "时间,状态,平台,模式,估算字节数,易读流量,来源链接,结果或错误\n"
-            try header.write(to: target, atomically: true, encoding: .utf8)
-        }
-        let fields = [
-            ISO8601DateFormatter().string(from: Date()), status, platform.rawValue, mode.displayName,
-            String(bytes), ByteDisplay.string(bytes), sourceURL, detail
-        ].map(csvEscape)
-        guard let data = (fields.joined(separator: ",") + "\n").data(using: .utf8),
-              let handle = try? FileHandle(forWritingTo: target) else {
-            throw NSError(domain: "TrafficHistory", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "无法写入流量记录.csv"])
-        }
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: data)
-    }
-
-    private static func csvEscape(_ value: String) -> String {
-        let normalized = value.replacingOccurrences(of: "\r\n", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\r", with: " ")
-        return "\"\(normalized.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 }
 
@@ -728,30 +690,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }, onTraffic: { bytes in
                     DispatchQueue.main.async { self.updateTraffic(bytes) }
                 })
-                try TrafficHistory.append(destination: destination, platform: videoInput.platform, mode: mode,
-                                          sourceURL: videoInput.url, bytes: result.downloadedBytes,
-                                          status: "成功", detail: result.folder.path)
                 DispatchQueue.main.async {
                     self.lastOutput = result.folder
                     self.openButton.isEnabled = true
                     self.statusLabel.stringValue = "完成"
                     self.updateTraffic(result.downloadedBytes)
                     self.appendLog("完成：\(result.folder.path)")
-                    self.appendLog("流量记录：\(destination.appendingPathComponent("流量记录.csv").path)")
                     self.setBusy(false)
                     NSSound(named: "Glass")?.play()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    do {
-                        try TrafficHistory.append(destination: destination, platform: videoInput.platform, mode: mode,
-                                                  sourceURL: videoInput.url, bytes: self.currentTrafficBytes,
-                                                  status: "失败", detail: error.localizedDescription)
-                    } catch {
-                        self.appendLog("流量历史写入失败：\(error.localizedDescription)")
-                    }
                     self.setBusy(false)
                     self.statusLabel.stringValue = "失败"
+                    self.appendLog("失败前估算下行流量：\(ByteDisplay.string(self.currentTrafficBytes))")
                     self.appendLog("错误：\(error.localizedDescription)")
                     self.showError(error.localizedDescription)
                 }
@@ -804,21 +756,6 @@ if CommandLine.arguments.count >= 6 && CommandLine.arguments[1] == "--integratio
         exit(0)
     } catch {
         fputs("integration-test error: \(error.localizedDescription)\n", stderr)
-        exit(3)
-    }
-} else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--traffic-history-test" {
-    let destination = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-    do {
-        try TrafficHistory.append(destination: destination, platform: .douyin, mode: .audioOnly,
-                                  sourceURL: "https://www.douyin.com/video/123", bytes: 4096,
-                                  status: "成功", detail: "测试结果")
-        try TrafficHistory.append(destination: destination, platform: .bilibili, mode: .automatic,
-                                  sourceURL: "https://www.bilibili.com/video/BVTEST", bytes: 1024,
-                                  status: "失败", detail: "测试错误")
-        print(destination.appendingPathComponent("流量记录.csv").path)
-        exit(0)
-    } catch {
-        fputs("traffic-history-test error: \(error.localizedDescription)\n", stderr)
         exit(3)
     }
 } else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--parse-input" {

@@ -49,14 +49,4 @@ fi
 info_file="$(find "$test_dir" -name '视频信息.txt' -type f | tail -1)"
 assert_contains "$(<"$info_file")" "估算下行流量："
 
-"$executable" --traffic-history-test "$test_dir" >/dev/null
-history_file="$test_dir/流量记录.csv"
-assert_contains "$(<"$history_file")" '"成功","抖音","仅音频","4096"'
-assert_contains "$(<"$history_file")" '"失败","Bilibili","自动","1024"'
-history_lines="$(wc -l < "$history_file" | tr -d ' ')"
-if [[ "$history_lines" != "3" ]]; then
-  echo "断言失败：流量记录应包含表头和两条任务记录"
-  exit 1
-fi
-
 echo "全部测试通过"
