@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Build products and caches
+build/
+dist/
+
+# Downloaded third-party binary
+vendor/yt-dlp
+
+# Local test output
+test-results/
