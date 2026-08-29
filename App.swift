@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import Darwin
 
@@ -6,6 +7,38 @@ enum ExtractMode: Int {
     case automatic = 0
     case subtitlesOnly = 1
     case audioOnly = 2
+}
+
+enum VideoPlatform: String {
+    case bilibili = "Bilibili"
+    case douyin = "抖音"
+
+    var fallbackTitle: String { "\(rawValue) 提取结果" }
+}
+
+struct VideoInput {
+    let url: String
+    let platform: VideoPlatform
+
+    static func parse(_ raw: String) -> VideoInput? {
+        guard let regex = try? NSRegularExpression(pattern: "https?://[^\\s<>]+", options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+              let range = Range(match.range, in: raw) else { return nil }
+
+        let trailing = CharacterSet(charactersIn: "，。！？；：、）》】」』'\".,!?;:)]}")
+        let candidate = String(raw[range]).trimmingCharacters(in: trailing)
+        guard let parsed = URL(string: candidate), let host = parsed.host?.lowercased() else { return nil }
+
+        if host == "bilibili.com" || host.hasSuffix(".bilibili.com")
+            || host == "b23.tv" || host.hasSuffix(".b23.tv") {
+            return VideoInput(url: candidate, platform: .bilibili)
+        }
+        if host == "douyin.com" || host.hasSuffix(".douyin.com")
+            || host == "iesdouyin.com" || host.hasSuffix(".iesdouyin.com") {
+            return VideoInput(url: candidate, platform: .douyin)
+        }
+        return nil
+    }
 }
 
 struct TranscriptCue {
@@ -172,9 +205,9 @@ final class ExtractorService {
 
     init(executable: URL) { runner = ProcessRunner(executable: executable) }
 
-    func extract(url: String, destination: URL, mode: ExtractMode, allParts: Bool,
+    func extract(url: String, platform: VideoPlatform, destination: URL, mode: ExtractMode, allParts: Bool,
                  browser: String?, log: @escaping (String) -> Void) throws -> URL {
-        let jobURL = fileManager.temporaryDirectory.appendingPathComponent("BiliExtractor-\(UUID().uuidString)")
+        let jobURL = fileManager.temporaryDirectory.appendingPathComponent("MediaExtractor-\(UUID().uuidString)")
         try fileManager.createDirectory(at: jobURL, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: jobURL) }
 
@@ -182,18 +215,22 @@ final class ExtractorService {
         log("正在读取视频信息…")
         let metadata = try runner.run(arguments: common + ["--skip-download", "--print", "%(title)s", url], onLine: log)
         guard metadata.0 == 0 else {
-            throw NSError(domain: "Extractor", code: 2, userInfo: [NSLocalizedDescriptionKey: friendlyError(metadata.1)])
+            throw NSError(domain: "Extractor", code: 2, userInfo: [NSLocalizedDescriptionKey: friendlyError(metadata.1, platform: platform)])
         }
         let title = metadata.1.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first(where: { !$0.isEmpty && !$0.hasPrefix("[") }) ?? "Bilibili 提取结果"
-        let bv = firstMatch(in: url, pattern: "BV[0-9A-Za-z]+") ?? ""
-        let folderBase = sanitize(title) + (bv.isEmpty ? "" : " [\(bv)]")
+            .first(where: { !$0.isEmpty && !$0.hasPrefix("[") }) ?? platform.fallbackTitle
+        let contentID: String
+        switch platform {
+        case .bilibili: contentID = firstMatch(in: url, pattern: "BV[0-9A-Za-z]+") ?? ""
+        case .douyin: contentID = firstMatch(in: url, pattern: "(?<=/video/)[0-9]+") ?? ""
+        }
+        let folderBase = sanitize(title, fallback: platform.fallbackTitle) + (contentID.isEmpty ? "" : " [\(contentID)]")
         let finalFolder = uniqueFolder(parent: destination, base: folderBase)
 
         var foundTranscript = false
         if mode != .audioOnly {
-            log("正在检查并提取现成字幕（不会下载视频）…")
+            log("正在检查并提取 \(platform.rawValue) 现成字幕（不会下载视频）…")
             let subtitleArgs = common + [
                 "--skip-download", "--write-subs", "--sub-langs", "all",
                 "--write-info-json", "-P", jobURL.path,
@@ -230,18 +267,32 @@ final class ExtractorService {
         }
 
         if !foundTranscript && mode != .subtitlesOnly {
-            log("没有找到可用字幕，开始下载最低码率纯音频…")
+            if platform == .douyin {
+                log("没有找到可用字幕，优先请求抖音独立音频流…")
+                log("若该视频不提供独立音频，将下载最低质量带音频文件并在本机剥离音轨。")
+            } else {
+                log("没有找到可用字幕，开始下载最低码率纯音频…")
+            }
+            let format = platform == .douyin ? "wa/w[acodec!=none]" : "wa"
             let audioArgs = common + [
-                "-f", "wa", "-P", jobURL.path,
+                "-f", format, "-P", jobURL.path,
                 "-o", "%(title).120B [%(id)s].%(ext)s", url
             ]
             let result = try runner.run(arguments: audioArgs, onLine: log)
-            guard result.0 == 0 else { throw NSError(domain: "Extractor", code: 4, userInfo: [NSLocalizedDescriptionKey: friendlyError(result.1)]) }
+            guard result.0 == 0 else { throw NSError(domain: "Extractor", code: 4, userInfo: [NSLocalizedDescriptionKey: friendlyError(result.1, platform: platform)]) }
             let audioFiles = mediaFiles(in: jobURL)
             guard !audioFiles.isEmpty else { throw NSError(domain: "Extractor", code: 5, userInfo: [NSLocalizedDescriptionKey: "音频下载完成，但没有找到输出文件。请更新应用内的 yt-dlp 后重试。"]) }
             try fileManager.createDirectory(at: finalFolder, withIntermediateDirectories: true)
             for file in audioFiles {
-                try fileManager.moveItem(at: file, to: finalFolder.appendingPathComponent(file.lastPathComponent))
+                if platform == .douyin && file.pathExtension.lowercased() == "mp4" {
+                    let target = uniqueFile(in: finalFolder, base: file.deletingPathExtension().lastPathComponent, extension: "m4a")
+                    log("正在本机剥离音轨：\(target.lastPathComponent)")
+                    try exportAudio(from: file, to: target)
+                } else {
+                    let target = uniqueFile(in: finalFolder, base: file.deletingPathExtension().lastPathComponent,
+                                            extension: file.pathExtension)
+                    try fileManager.moveItem(at: file, to: target)
+                }
             }
             log("已保存最低码率纯音频。")
         }
@@ -307,11 +358,11 @@ final class ExtractorService {
         return candidate
     }
 
-    private func sanitize(_ value: String) -> String {
+    private func sanitize(_ value: String, fallback: String) -> String {
         var clean = value.replacingOccurrences(of: "[/:*?\"<>|]", with: "-", options: .regularExpression)
         clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.count > 100 { clean = String(clean.prefix(100)) }
-        return clean.isEmpty ? "Bilibili 提取结果" : clean
+        return clean.isEmpty ? fallback : clean
     }
 
     private func firstMatch(in text: String, pattern: String) -> String? {
@@ -321,17 +372,51 @@ final class ExtractorService {
         return String(text[range])
     }
 
-    private func friendlyError(_ output: String) -> String {
+    private func friendlyError(_ output: String, platform: VideoPlatform) -> String {
         let lower = output.lowercased()
-        if lower.contains("login") || lower.contains("cookie") || lower.contains("会员") || lower.contains("登录") {
-            return "该内容可能需要登录。请在浏览器登录 Bilibili，并在应用中选择对应浏览器后重试。"
+        if lower.contains("fresh cookies") && platform == .douyin {
+            return "抖音需要最新 Cookie。请先用 Chrome、Safari、Firefox 或 Edge 打开一次该抖音视频，再在应用中选择同一浏览器后重试。"
         }
-        if lower.contains("unsupported url") { return "无法识别该链接。请粘贴 www.bilibili.com/video/BV… 格式的视频地址。" }
-        if lower.contains("412") {
+        if lower.contains("login") || lower.contains("cookie") || lower.contains("会员") || lower.contains("登录") {
+            return "该内容可能需要登录或最新 Cookie。请在浏览器打开并登录 \(platform.rawValue)，再在应用中选择对应浏览器后重试。"
+        }
+        if lower.contains("requested format is not available") && platform == .douyin {
+            return "这个抖音视频没有可下载的音频格式。请先在浏览器确认视频能正常播放，并选择该浏览器的登录状态后重试。"
+        }
+        if lower.contains("unsupported url") { return "无法识别该链接。请粘贴 Bilibili、b23.tv、douyin.com 或 v.douyin.com 视频链接。" }
+        if lower.contains("412") && platform == .bilibili {
             return "Bilibili 启动了访问风控（HTTP 412）。请先在 Chrome、Safari 或 Firefox 登录 Bilibili，然后在应用的“登录状态”中选择该浏览器再重试。也可以稍后更换网络重试。"
         }
-        if lower.contains("403") { return "Bilibili 拒绝了请求。请使用包含 www 的完整链接，或选择已登录的浏览器后重试。" }
+        if lower.contains("403") { return "\(platform.rawValue) 拒绝了请求。请先在浏览器确认视频能播放，并选择同一浏览器的登录状态后重试。" }
         return output.components(separatedBy: .newlines).suffix(6).joined(separator: "\n")
+    }
+
+    private func uniqueFile(in folder: URL, base: String, extension ext: String) -> URL {
+        var candidate = folder.appendingPathComponent(base).appendingPathExtension(ext)
+        var index = 2
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = folder.appendingPathComponent("\(base) (\(index))").appendingPathExtension(ext)
+            index += 1
+        }
+        return candidate
+    }
+
+    private func exportAudio(from source: URL, to destination: URL) throws {
+        let asset = AVURLAsset(url: source)
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            throw NSError(domain: "Extractor", code: 6, userInfo: [NSLocalizedDescriptionKey: "macOS 无法读取这个抖音媒体文件的音轨。"])
+        }
+        session.outputURL = destination
+        session.outputFileType = .m4a
+        session.shouldOptimizeForNetworkUse = true
+        let semaphore = DispatchSemaphore(value: 0)
+        session.exportAsynchronously { semaphore.signal() }
+        semaphore.wait()
+        guard session.status == .completed else {
+            try? fileManager.removeItem(at: destination)
+            throw NSError(domain: "Extractor", code: 7, userInfo: [NSLocalizedDescriptionKey:
+                session.error?.localizedDescription ?? "从抖音媒体文件剥离音轨失败。"])
+        }
     }
 }
 
@@ -362,9 +447,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于 B站字幕音频提取器", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "关于视频字幕音频提取器", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "退出 B站字幕音频提取器", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "退出视频字幕音频提取器", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
 
         let editMenuItem = NSMenuItem()
@@ -388,7 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildUI() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 570),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "B站字幕音频提取器"
+        window.title = "视频字幕音频提取器"
         window.center()
         window.isReleasedWhenClosed = false
 
@@ -405,12 +490,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor, constant: -18)
         ])
 
-        let heading = NSTextField(labelWithString: "粘贴 Bilibili 链接，优先提取字幕；没有字幕时只取低码率音频。")
+        let heading = NSTextField(labelWithString: "粘贴 Bilibili 或抖音链接/分享文本，优先提取字幕；否则只保存音频。")
         heading.font = .systemFont(ofSize: 15, weight: .medium)
         root.addArrangedSubview(heading)
 
-        root.addArrangedSubview(label("Bilibili 视频链接"))
-        urlField.placeholderString = "https://www.bilibili.com/video/BV…"
+        root.addArrangedSubview(label("视频链接或分享文本"))
+        urlField.placeholderString = "Bilibili / b23.tv / douyin.com / v.douyin.com"
         urlField.font = .systemFont(ofSize: 14)
         urlField.isEditable = true
         urlField.isSelectable = true
@@ -430,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         browserRow.addArrangedSubview(label("登录状态"))
         browserPopup.addItems(withTitles: ["不使用浏览器登录状态", "Chrome", "Safari", "Firefox", "Edge"])
         browserRow.addArrangedSubview(browserPopup)
-        let browserHint = NSTextField(labelWithString: "公开内容通常无需选择；受限内容请选择已登录 B 站的浏览器。")
+        let browserHint = NSTextField(labelWithString: "抖音通常需要最新 Cookie；先在浏览器打开视频，再选择同一浏览器。")
         browserHint.textColor = .secondaryLabelColor
         browserHint.font = .systemFont(ofSize: 11)
         browserRow.addArrangedSubview(browserHint)
@@ -496,10 +581,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func startExtraction() {
-        let rawURL = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = URL(string: rawURL), let host = parsed.host?.lowercased(),
-              host == "bilibili.com" || host.hasSuffix(".bilibili.com") || host == "b23.tv" || host.hasSuffix(".b23.tv") else {
-            showError("请粘贴有效的 Bilibili 或 b23.tv 视频链接。")
+        let rawInput = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let videoInput = VideoInput.parse(rawInput) else {
+            showError("请粘贴有效的 Bilibili、b23.tv、douyin.com 或 v.douyin.com 视频链接，也可以直接粘贴含链接的抖音分享文本。")
             return
         }
         guard FileManager.default.fileExists(atPath: pathField.stringValue) else {
@@ -513,7 +597,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setBusy(true)
         logView.string = ""
-        appendLog("开始处理：\(rawURL)")
+        appendLog("已识别平台：\(videoInput.platform.rawValue)")
+        appendLog("开始处理：\(videoInput.url)")
         let mode = ExtractMode(rawValue: modePopup.indexOfSelectedItem) ?? .automatic
         let destination = URL(fileURLWithPath: pathField.stringValue, isDirectory: true)
         let browserMap: [Int: String?] = [0: nil, 1: "chrome", 2: "safari", 3: "firefox", 4: "edge"]
@@ -524,7 +609,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             do {
                 let service = ExtractorService(executable: executable)
-                let folder = try service.extract(url: rawURL, destination: destination, mode: mode,
+                let folder = try service.extract(url: videoInput.url, platform: videoInput.platform,
+                                                 destination: destination, mode: mode,
                                                  allParts: processAll, browser: browser ?? nil) { line in
                     DispatchQueue.main.async { self.appendLog(line) }
                 }
@@ -572,9 +658,14 @@ if CommandLine.arguments.count >= 6 && CommandLine.arguments[1] == "--integratio
     let destination = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
     let testURL = CommandLine.arguments[4]
     let mode = ExtractMode(rawValue: Int(CommandLine.arguments[5]) ?? 0) ?? .automatic
+    guard let input = VideoInput.parse(testURL) else {
+        fputs("integration-test error: unsupported test URL\n", stderr)
+        exit(2)
+    }
     do {
         let folder = try ExtractorService(executable: executable).extract(
-            url: testURL, destination: destination, mode: mode, allParts: false, browser: nil,
+            url: input.url, platform: input.platform, destination: destination,
+            mode: mode, allParts: false, browser: nil,
             log: { print($0) }
         )
         print("output=\(folder.path)")
@@ -583,6 +674,14 @@ if CommandLine.arguments.count >= 6 && CommandLine.arguments[1] == "--integratio
         fputs("integration-test error: \(error.localizedDescription)\n", stderr)
         exit(3)
     }
+} else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--parse-input" {
+    if let input = VideoInput.parse(CommandLine.arguments[2]) {
+        print("platform=\(input.platform.rawValue)")
+        print("url=\(input.url)")
+        exit(0)
+    }
+    fputs("unsupported input\n", stderr)
+    exit(2)
 } else if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--parse-file" {
     let input = URL(fileURLWithPath: CommandLine.arguments[2])
     let cues = TranscriptParser.parse(url: input)

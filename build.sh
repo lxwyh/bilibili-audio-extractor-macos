@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 OUTPUT_DIR="$SCRIPT_DIR/dist"
-APP_NAME="B站字幕音频提取器.app"
+APP_NAME="视频字幕音频提取器.app"
 APP_DIR="$OUTPUT_DIR/$APP_NAME"
 ICON_DIR="$SCRIPT_DIR/build/AppIcon.iconset"
 MODULE_CACHE="$SCRIPT_DIR/build/ModuleCache"
@@ -39,6 +39,7 @@ fi
   -swift-version 5 \
   -O \
   -framework AppKit \
+  -framework AVFoundation \
   "$SCRIPT_DIR/App.swift" \
   -o "$APP_DIR/Contents/MacOS/BiliAudioExtractor"
 
@@ -49,7 +50,7 @@ fi
 /bin/chmod +x "$APP_DIR/Contents/MacOS/BiliAudioExtractor" "$APP_DIR/Contents/Resources/yt-dlp"
 
 /usr/bin/codesign --force --deep --sign - "$APP_DIR"
-/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/B站字幕音频提取器.zip"
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/视频字幕音频提取器.zip"
 /bin/cp "$SCRIPT_DIR/README.md" "$OUTPUT_DIR/使用说明.md"
 
 echo "$APP_DIR"
